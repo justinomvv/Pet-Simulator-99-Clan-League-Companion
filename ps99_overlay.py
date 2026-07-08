@@ -32,6 +32,7 @@ import io
 import json
 import math
 import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -350,6 +351,9 @@ class Overlay(tk.Tk):
         self.pinned = tk.BooleanVar(value=True)
         self.webhook_enabled = tk.BooleanVar(value=False)
         self.webhook_url = tk.StringVar(value="")
+        self.stall_alert_enabled = tk.BooleanVar(value=False)
+        self.stall_target_player = tk.StringVar(value="")   # blank = whole clan/league total
+        self.stall_ping_id = tk.StringVar(value="")          # Discord user ID to @ping, optional
 
         self._entity = None          # last clan/league we fetched
         self._entity_kind = None
@@ -372,6 +376,10 @@ class Overlay(tk.Tk):
         self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self._spinner_idx = 0
         self._pending_last_search = None
+        self._stall_last_points = None     # last-seen points value for the stall target
+        self._stall_last_change_ts = None  # when that value last actually changed
+        self._stall_alerting = False       # whether we're currently in "stalled" state
+        self._stall_loop_started = False
 
         self._load_settings()
 
@@ -381,6 +389,10 @@ class Overlay(tk.Tk):
         self._build_header()
         self._build_table()
         self._build_status_bar()
+
+        self._apply_icon()
+        self.update_idletasks()
+        self._show_in_taskbar()
 
         self._drag = {"x": 0, "y": 0}
 
@@ -395,8 +407,14 @@ class Overlay(tk.Tk):
                     self.show_country, self.show_points, self.show_gems,
                     self.show_joined, self.show_average, self.member_count,
                     self.username_filter, self.pinned, self.webhook_enabled,
-                    self.webhook_url):
+                    self.webhook_url, self.stall_alert_enabled,
+                    self.stall_target_player, self.stall_ping_id):
             var.trace_add("write", self._schedule_save)
+
+        # switching who/what we're watching for a stall should restart the clock
+        self.stall_target_player.trace_add("write", lambda *_: self._reset_stall_tracking())
+
+        self._start_stall_loop()
 
         if self._pending_last_search:
             self.search_entry.insert(0, self._pending_last_search)
@@ -419,6 +437,9 @@ class Overlay(tk.Tk):
             "pinned": self.pinned.get(),
             "webhook_enabled": self.webhook_enabled.get(),
             "webhook_url": self.webhook_url.get(),
+            "stall_alert_enabled": self.stall_alert_enabled.get(),
+            "stall_target_player": self.stall_target_player.get(),
+            "stall_ping_id": self.stall_ping_id.get(),
             "last_search": self.search_entry.get() if hasattr(self, "search_entry") else "",
             "window_pos": self.geometry(),
         }
@@ -459,6 +480,9 @@ class Overlay(tk.Tk):
             self.pinned.set(bool(data.get("pinned", True)))
             self.webhook_enabled.set(bool(data.get("webhook_enabled", False)))
             self.webhook_url.set(data.get("webhook_url", ""))
+            self.stall_alert_enabled.set(bool(data.get("stall_alert_enabled", False)))
+            self.stall_target_player.set(data.get("stall_target_player", ""))
+            self.stall_ping_id.set(data.get("stall_ping_id", ""))
             geo = data.get("window_pos")
             if geo:
                 self.geometry(geo)
@@ -511,6 +535,43 @@ class Overlay(tk.Tk):
         self.pinned.set(not self.pinned.get())
         self.attributes("-topmost", self.pinned.get())
         self.pin_lbl.configure(fg=ACCENT if self.pinned.get() else FG_DIM)
+
+    def _apply_icon(self):
+        """Set the window icon when running from source. When frozen into
+        an exe, PyInstaller already baked icon.ico in via --icon, so there's
+        nothing to do here — Windows picks it up on its own."""
+        if getattr(sys, "frozen", False):
+            return
+        candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
+        if os.path.exists(candidate):
+            try:
+                self.iconbitmap(candidate)
+            except Exception:
+                pass  # not fatal, just means no icon this run
+
+    def _show_in_taskbar(self):
+        """overrideredirect(True) makes the window a plain WS_POPUP under
+        Windows, which Explorer never gives a taskbar button — that's why
+        this app has basically been invisible outside alt-tab. This flips
+        the window's extended style to WS_EX_APPWINDOW (what a normal
+        top-level app uses) instead of WS_EX_TOOLWINDOW, then hides and
+        re-shows the window once, since Windows only creates the taskbar
+        button on that hidden->shown transition."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            GWL_EXSTYLE = -20
+            WS_EX_APPWINDOW = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            self.withdraw()
+            self.after(10, self.deiconify)
+        except Exception:
+            pass  # worst case it just stays taskbar-less like before
 
     # ---- search row ---------------------------------------------------
     def _style_combobox(self, box):
@@ -656,6 +717,37 @@ class Overlay(tk.Tk):
         test_btn.bind("<Button-1>", lambda e: self._send_webhook_update(force=True))
         self.webhook_status = tk.Label(btn_row, text="", bg=BG2, fg=FG_DIM, font=FONT)
         self.webhook_status.pack(side="left", padx=8)
+
+        sep = tk.Frame(self.webhook_panel, bg="#3a3c42", height=1)
+        sep.pack(fill="x", padx=8, pady=(2, 6))
+
+        tk.Label(self.webhook_panel, text="⚠ Stall Alert", bg=BG2, fg=FG, font=FONT_B,
+                 anchor="w").pack(fill="x", padx=8)
+        tk.Label(self.webhook_panel,
+                 text="Pings the webhook every 30s if points stop moving for 5+ minutes.",
+                 bg=BG2, fg=FG_DIM, font=("Segoe UI", 8), anchor="w", justify="left",
+                 wraplength=280).pack(fill="x", padx=8, pady=(0, 4))
+
+        stall_chk_row = tk.Frame(self.webhook_panel, bg=BG2)
+        stall_chk_row.pack(fill="x", padx=8, pady=(0, 4))
+        tk.Checkbutton(stall_chk_row, text="Enable stall alert", variable=self.stall_alert_enabled,
+                        bg=BG2, fg=FG, selectcolor=BG2, activebackground=BG2,
+                        activeforeground=FG, font=FONT, anchor="w").pack(side="left")
+
+        target_row = tk.Frame(self.webhook_panel, bg=BG2)
+        target_row.pack(fill="x", padx=8, pady=(0, 4))
+        tk.Label(target_row, text="Player (blank = whole clan/league):", bg=BG2, fg=FG,
+                 font=FONT).pack(side="left")
+        target_entry = tk.Entry(target_row, textvariable=self.stall_target_player, bg=BG, fg=FG,
+                                 insertbackground=FG, relief="flat", font=FONT, width=14)
+        target_entry.pack(side="left", padx=4, ipady=2)
+
+        ping_row = tk.Frame(self.webhook_panel, bg=BG2)
+        ping_row.pack(fill="x", padx=8, pady=(0, 10))
+        tk.Label(ping_row, text="Discord User ID to ping:", bg=BG2, fg=FG, font=FONT).pack(side="left")
+        ping_entry = tk.Entry(ping_row, textvariable=self.stall_ping_id, bg=BG, fg=FG,
+                               insertbackground=FG, relief="flat", font=FONT, width=18)
+        ping_entry.pack(side="left", padx=4, ipady=2)
 
     def _show_webhook_tab(self):
         self._webhook_tab_open = True
@@ -814,6 +906,7 @@ class Overlay(tk.Tk):
             return
         self._prev_points = {}
         self._last_rate_raw = {}
+        self._reset_stall_tracking()
         self._fetch(name, self.mode.get())
 
     def _fetch(self, name, kind):
@@ -859,6 +952,7 @@ class Overlay(tk.Tk):
         self._rank = rank
         self._rank_total = total
         self._advance_rate_history()
+        self._update_stall_tracking()
         self._status_base = f"Updated {datetime.now().strftime('%H:%M:%S')}"
         self._seconds_left = self.interval.get()
         self._render_status()
@@ -946,21 +1040,42 @@ class Overlay(tk.Tk):
         self.tree["displaycolumns"] = cols
         self.tree.heading("rate", text="Δ" if self.view_mode.get() == "live" else "≈/hr")
 
-        rows = self._build_row_data(e, kind)
+        all_rows = self._build_row_data(e, kind)
+        rows = all_rows
 
         needle = self.username_filter.get().strip().lower()
         if needle:
             rows = [r for r in rows if needle in r["name"].lower()]
         rows = rows[: self.member_count.get()]
 
-        if self.show_average.get() and rows:
-            pts_vals = [r["points"] for r in rows if r["points"] is not None]
-            gem_vals = [r["gems"] for r in rows if r["gems"] is not None]
+        if self.show_average.get() and all_rows:
+            # Averages are computed over the WHOLE tracked roster, not just
+            # whatever happens to be visible — otherwise "avg" would swing
+            # around any time you touched the username filter or the "show
+            # top" count, or read as the average of a single filtered-down
+            # row, which isn't really an average of anything.
+            pts_vals = [r["points"] for r in all_rows if r["points"] is not None]
+            gem_vals = [r["gems"] for r in all_rows if r["gems"] is not None]
             parts = []
             if pts_vals:
                 parts.append(f"avg {fmt_num(sum(pts_vals) / len(pts_vals))} pts/member")
             if gem_vals:
                 parts.append(f"avg {fmt_num(sum(gem_vals) / len(gem_vals))} 💎/member")
+
+            rate_vals = []
+            hourly = self.view_mode.get() == "hourly"
+            for r in all_rows:
+                raw = self._last_rate_raw.get(r["uid"])
+                if raw is None:
+                    continue
+                delta, dt = raw
+                rate_vals.append(delta * 3600 / dt if hourly else delta)
+            if rate_vals:
+                avg_rate = sum(rate_vals) / len(rate_vals)
+                sign = "+" if avg_rate > 0 else ""
+                unit = "≈/hr" if hourly else "Δ"
+                parts.append(f"avg {sign}{fmt_num(avg_rate)} {unit}/member")
+
             self.avg_lbl.configure(text="   ·   ".join(parts) if parts else "")
         else:
             self.avg_lbl.configure(text="")
@@ -1009,14 +1124,32 @@ class Overlay(tk.Tk):
         self._last_rate_raw = raw
 
     # ---- discord webhook ---------------------------------------------------
+    def _post_webhook(self, content, status_ok="Sent ✓", status_fail="Failed to send"):
+        """Fire-and-forget POST to the configured webhook URL. Shared by the
+        regular update message and the stall alert so there's only one place
+        that actually talks to Discord."""
+        url = self.webhook_url.get().strip()
+        if not url:
+            return
+
+        def worker():
+            try:
+                requests.post(url, json={"content": content}, timeout=TIMEOUT)
+                ok, msg = True, status_ok
+            except Exception:
+                ok, msg = False, status_fail
+            if hasattr(self, "webhook_status"):
+                self.after(0, lambda: self.webhook_status.configure(
+                    text=msg, fg=("#3ba55d" if ok else "#ed4245")))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _send_webhook_update(self, force=False):
         """Post whatever clan/league we're tracking — rank + points — to
-        the Discord webhook URL, if one's set. Runs in a background thread
-        so it never blocks the UI. `force=True` is for the test button —
-        sends even if the toggle's off, so you can check the URL works
-        before actually turning live updates on."""
-        url = self.webhook_url.get().strip()
-        if not url or self._entity is None:
+        the Discord webhook URL, if one's set. `force=True` is for the test
+        button — sends even if the toggle's off, so you can check the URL
+        works before actually turning live updates on."""
+        if not self.webhook_url.get().strip() or self._entity is None:
             return
         if not force and not self.webhook_enabled.get():
             return
@@ -1032,19 +1165,80 @@ class Overlay(tk.Tk):
             lines.append(f"Outside the checked top ranks (of {self._rank_total:,})")
         if points is not None:
             lines.append(f"Points: {fmt_num(points)}")
-        content = "\n".join(lines)
+        self._post_webhook("\n".join(lines))
 
-        def worker():
-            try:
-                requests.post(url, json={"content": content}, timeout=TIMEOUT)
-                ok, msg = True, "Sent ✓"
-            except Exception:
-                ok, msg = False, "Failed to send"
-            if hasattr(self, "webhook_status"):
-                self.after(0, lambda: self.webhook_status.configure(
-                    text=msg, fg=("#3ba55d" if ok else "#ed4245")))
+    # ---- stall alert ---------------------------------------------------
+    def _reset_stall_tracking(self):
+        """Clear the stall clock — called on a new search, or when the
+        watched target (whole clan/league vs a specific player) changes,
+        so a fresh baseline gets picked up on the next poll instead of
+        immediately looking "stalled" against stale data."""
+        self._stall_last_points = None
+        self._stall_last_change_ts = None
+        self._stall_alerting = False
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _get_stall_target_points(self):
+        """Current points for whatever the stall alert is watching — the
+        clan/league's total, or one specific member if a name was given."""
+        target = self.stall_target_player.get().strip()
+        if not target:
+            return self._entity.get("Points")
+        for r in self._build_row_data(self._entity, self._entity_kind):
+            if r["name"].lower() == target.lower():
+                return r["points"]
+        return None  # named player isn't in the currently loaded roster
+
+    def _update_stall_tracking(self):
+        """Called once per real poll. Just remembers the target's points
+        and when they last actually changed — the every-30s alert loop
+        below reads this independently of the refresh interval."""
+        if self._entity is None:
+            return
+        pts = self._get_stall_target_points()
+        if pts is None:
+            return
+        now = time.time()
+        if self._stall_last_change_ts is None:
+            self._stall_last_points, self._stall_last_change_ts = pts, now
+            return
+        if pts != self._stall_last_points:
+            was_alerting = self._stall_alerting
+            self._stall_last_points, self._stall_last_change_ts = pts, now
+            if was_alerting:
+                self._stall_alerting = False
+                self._send_stall_alert(recovered=True)
+
+    def _start_stall_loop(self):
+        if self._stall_loop_started:
+            return
+        self._stall_loop_started = True
+        self._stall_tick()
+
+    def _stall_tick(self):
+        # Runs on its own 30s clock, independent of the refresh interval —
+        # that's what makes "alert every 30s" actually mean every 30s even
+        # if the person's refresh rate is set to 60s.
+        if (self.stall_alert_enabled.get() and self._entity is not None
+                and self._stall_last_change_ts is not None):
+            stalled_for = time.time() - self._stall_last_change_ts
+            if stalled_for >= 300:  # 5 minutes
+                self._stall_alerting = True
+                self._send_stall_alert(recovered=False)
+        self.after(30000, self._stall_tick)
+
+    def _send_stall_alert(self, recovered):
+        if not self.webhook_url.get().strip() or self._entity is None:
+            return
+        ping = self.stall_ping_id.get().strip()
+        mention = f"<@{ping}> " if ping else ""
+        target = self.stall_target_player.get().strip()
+        label = target if target else f"{self._entity.get('Name', '?')} (total)"
+        if recovered:
+            content = f"{mention}✅ **{label}** is gaining points again."
+        else:
+            mins = int((time.time() - self._stall_last_change_ts) / 60)
+            content = f"{mention}⚠️ **{label}** hasn't gained any points in {mins}+ minutes."
+        self._post_webhook(content)
 
     def _build_row_data(self, e, kind):
         rows = []
